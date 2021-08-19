@@ -353,4 +353,44 @@ describe("cleanup", () => {
 		expect(fn).toHaveBeenCalledTimes(1);
 		expect(fn).toHaveBeenCalledWith(undefined);
 	});
+
+	test.only("async unmount", async () => {
+		let resolve: () => unknown;
+		const promise = new Promise<void>((resolve1) => (resolve = resolve1));
+		function Linger(this: Context): Element {
+			this.cleanup(() => promise);
+			return <div>linger</div>;
+		}
+
+		renderer.render(
+			<div>
+				<div>before</div>
+				<Linger />
+				<div>after</div>
+			</div>,
+			document.body,
+		);
+
+		expect(document.body.innerHTML).toEqual(
+			"<div><div>before</div><div>linger</div><div>after</div></div>",
+		);
+
+		renderer.render(
+			<div>
+				<div>before</div>
+				<div>after</div>
+			</div>,
+			document.body,
+		);
+
+		expect(document.body.innerHTML).toEqual(
+			"<div><div>before</div><div>linger</div><div>after</div></div>",
+		);
+
+		resolve!();
+
+		expect(document.body.innerHTML).toEqual(
+			"<div><div>before</div><div>after</div></div>",
+		);
+	});
 });

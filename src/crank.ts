@@ -564,6 +564,7 @@ export interface RendererImpl<
 		tag: TTag,
 		node: TNode,
 		props: TagProps<TTag>,
+		nested: boolean,
 	): unknown;
 
 	flush(root: TRoot): unknown;
@@ -706,6 +707,7 @@ function commitRootRender<TNode, TRoot extends TNode, TResult>(
 
 	ret.cached = unwrap(childValues);
 	if (root == null) {
+		// EXAMPLE 1: unmounting because there is no root to store against
 		unmount(renderer, ret, ctx, ret);
 	}
 
@@ -725,17 +727,22 @@ function diffChildren<TNode, TScope, TRoot extends TNode, TResult>(
 	const newRetained: typeof oldRetained = [];
 	const newChildren = arrayify(children);
 	const values: Array<Promise<ElementValue<TNode>> | ElementValue<TNode>> = [];
-	let graveyard: Array<Retainer<TNode>> | undefined;
-	let childrenByKey: Map<Key, Retainer<TNode>> | undefined;
+	let graveyard: Array<[Retainer<TNode>, number]> | undefined;
+	let childrenByKey: Map<Key, [Retainer<TNode>, number]> | undefined;
 	let seenKeys: Set<Key> | undefined;
 	let isAsync = false;
-	let oi = 0,
-		oldLength = oldRetained.length;
-	for (let ni = 0, newLength = newChildren.length; ni < newLength; ni++) {
+	let oldIndex = 0;
+	for (
+		let newIndex = 0,
+			oldLength = oldRetained.length,
+			newLength = newChildren.length;
+		newIndex < newLength;
+		newIndex++
+	) {
 		// We make sure we don’t access indices out of bounds to prevent
 		// deoptimizations.
-		let ret = oi >= oldLength ? undefined : oldRetained[oi];
-		let child = narrow(newChildren[ni]);
+		let ret = oldIndex >= oldLength ? undefined : oldRetained[oldIndex];
+		let child = narrow(newChildren[newIndex]);
 		{
 			// Aligning new children with old retainers
 			let oldKey = typeof ret === "object" ? ret.el.key : undefined;
@@ -750,21 +757,26 @@ function diffChildren<TNode, TScope, TRoot extends TNode, TResult>(
 					childrenByKey.delete(newKey);
 				}
 
-				oi++;
+				oldIndex++;
 			} else {
-				childrenByKey = childrenByKey || createChildrenByKey(oldRetained, oi);
+				childrenByKey =
+					childrenByKey || createChildrenByKey(oldRetained, oldIndex);
 				if (newKey === undefined) {
+					// skip to the next unkeyed child
 					while (ret !== undefined && oldKey !== undefined) {
-						oi++;
-						ret = oldRetained[oi];
+						oldIndex++;
+						ret = oldRetained[oldIndex];
 						oldKey = typeof ret === "object" ? ret.el.key : undefined;
 					}
 
-					oi++;
+					oldIndex++;
 				} else {
-					ret = childrenByKey.get(newKey);
-					if (ret !== undefined) {
+					const tuple = childrenByKey.get(newKey);
+					if (tuple === undefined) {
+						ret = undefined;
+					} else {
 						childrenByKey.delete(newKey);
+						ret = tuple[0];
 					}
 
 					(seenKeys = seenKeys || new Set()).add(newKey);
@@ -784,7 +796,7 @@ function diffChildren<TNode, TScope, TRoot extends TNode, TResult>(
 					ret.el = child;
 				} else {
 					if (typeof ret === "object") {
-						(graveyard = graveyard || []).push(ret);
+						(graveyard = graveyard || []).push([ret, oldIndex]);
 					}
 
 					const fallback = ret;
@@ -826,7 +838,7 @@ function diffChildren<TNode, TScope, TRoot extends TNode, TResult>(
 		} else {
 			// child is a string or undefined
 			if (typeof ret === "object") {
-				(graveyard = graveyard || []).push(ret);
+				(graveyard = graveyard || []).push([ret, oldIndex]);
 			}
 
 			if (typeof child === "string") {
@@ -836,43 +848,62 @@ function diffChildren<TNode, TScope, TRoot extends TNode, TResult>(
 			}
 		}
 
-		values[ni] = value;
-		newRetained[ni] = ret;
+		values[newIndex] = value;
+		newRetained[newIndex] = ret;
 	}
 
-	// cleanup remaining retainers
-	for (; oi < oldLength; oi++) {
-		const ret = oldRetained[oi];
-		if (typeof ret === "object" && typeof ret.el.key === "undefined") {
-			(graveyard = graveyard || []).push(ret);
+	const indices: Array<number> = [];
+	if (childrenByKey !== undefined && childrenByKey.size > 0) {
+		graveyard = graveyard || [];
+		for (const [ret, i] of childrenByKey.values()) {
+			if (i < oldIndex) {
+				graveyard.push([ret, i]);
+				indices.push(i);
+			}
 		}
 	}
 
-	if (childrenByKey !== undefined && childrenByKey.size > 0) {
-		(graveyard = graveyard || []).push(...childrenByKey.values());
+	// cleanup remaining retainers
+	for (; oldIndex < oldRetained.length; oldIndex++) {
+		const ret = oldRetained[oldIndex];
+		if (typeof ret === "object") {
+			(graveyard = graveyard || []).push([ret, oldIndex]);
+			indices.push(oldIndex);
+		}
 	}
 
 	parent.children = unwrap(newRetained);
 	if (isAsync) {
-		let childValues1 = Promise.all(values).finally(() => {
+		let onCommit!: Function;
+		const childValues1 = Promise.race([
+			Promise.all(values),
+			new Promise<any>((resolve) => (onCommit = resolve)),
+		]).then((values) => {
+			// TODO: async unmounting
+			// The challenge is that we need to make sure
+			//
+			// 1. asynchronously unmounting retainers get added back to child
+			// retainers.
+			// 2. values from all graveyards are added to the return value of this function.
+			//
+			// As far as I can tell, when child renderings are raced, it seems that if a later rendering wins, this callback will be called for later renderings first.
 			if (graveyard) {
 				for (let i = 0; i < graveyard.length; i++) {
-					unmount(renderer, host, ctx, graveyard[i]);
+					const p = unmount(renderer, host, ctx, graveyard[i][0]);
+					if (p) {
+						console.log("ASYNC UNMOUNT", graveyard[i][0]);
+					}
 				}
 			}
-		});
 
-		let onChildValues!: Function;
-		childValues1 = Promise.race([
-			childValues1,
-			new Promise<any>((resolve) => (onChildValues = resolve)),
-		]);
+			return values;
+		});
 
 		if (parent.onCommit) {
 			parent.onCommit(childValues1);
 		}
 
-		parent.onCommit = onChildValues;
+		parent.onCommit = onCommit;
 		return childValues1.then((childValues) => {
 			parent.inflight = parent.fallback = undefined;
 			return normalize(childValues);
@@ -881,7 +912,10 @@ function diffChildren<TNode, TScope, TRoot extends TNode, TResult>(
 
 	if (graveyard) {
 		for (let i = 0; i < graveyard.length; i++) {
-			unmount(renderer, host, ctx, graveyard[i]);
+			const p = unmount(renderer, host, ctx, graveyard[i][0]);
+			if (p) {
+				console.log("SYNC UNMOUNT", graveyard[i][0]);
+			}
 		}
 	}
 
@@ -898,12 +932,12 @@ function diffChildren<TNode, TScope, TRoot extends TNode, TResult>(
 function createChildrenByKey<TNode>(
 	children: Array<RetainerChild<TNode>>,
 	offset: number,
-): Map<Key, Retainer<TNode>> {
-	const childrenByKey = new Map<Key, Retainer<TNode>>();
+): Map<Key, [Retainer<TNode>, number]> {
+	const childrenByKey = new Map<Key, [Retainer<TNode>, number]>();
 	for (let i = offset; i < children.length; i++) {
 		const child = children[i];
 		if (typeof child === "object" && typeof child.el.key !== "undefined") {
-			childrenByKey.set(child.el.key, child);
+			childrenByKey.set(child.el.key, [child, i]);
 		}
 	}
 
@@ -1103,10 +1137,15 @@ function unmount<TNode, TScope, TRoot extends TNode, TResult>(
 	host: Retainer<TNode>,
 	ctx: ContextInternals<TNode, TScope, TRoot, TResult> | undefined,
 	ret: Retainer<TNode>,
-): void {
+	nested: boolean = false,
+): Promise<undefined> | undefined {
+	let result: Promise<undefined> | undefined;
 	if (typeof ret.el.tag === "function") {
 		ctx = ret.ctx as ContextInternals<TNode, TScope, TRoot, TResult>;
-		unmountComponent(ctx);
+		const result1 = unmountComponent(ctx);
+		if (nested) {
+			result = result1;
+		}
 	} else if (ret.el.tag === Portal) {
 		host = ret;
 		renderer.arrange(
@@ -1120,6 +1159,8 @@ function unmount<TNode, TScope, TRoot extends TNode, TResult>(
 		flush(renderer, host.value);
 	} else if (ret.el.tag !== Fragment) {
 		if (isEventTarget(ret.value)) {
+			// TODO: consider doing this once at the root and passing in listener
+			// records elsewhere
 			const records = getListenerRecords(ctx, host);
 			for (let i = 0; i < records.length; i++) {
 				const record = records[i];
@@ -1131,17 +1172,20 @@ function unmount<TNode, TScope, TRoot extends TNode, TResult>(
 			}
 		}
 
-		renderer.dispose(ret.el.tag, ret.value as TNode, ret.el.props);
+		renderer.dispose(ret.el.tag, ret.value as TNode, ret.el.props, nested);
 		host = ret;
 	}
 
+	// defer this by
 	const children = wrap(ret.children);
 	for (let i = 0; i < children.length; i++) {
 		const child = children[i];
 		if (typeof child === "object") {
-			unmount(renderer, host, ctx, child);
+			unmount(renderer, host, ctx, child, true);
 		}
 	}
+
+	return result;
 }
 
 /*** CONTEXT FLAGS ***/
@@ -2052,7 +2096,10 @@ function resumeCtxIterator(ctx: ContextInternals): void {
 }
 
 // TODO: async unmounting
-function unmountComponent(ctx: ContextInternals): void {
+function unmountComponent(
+	ctx: ContextInternals,
+): Promise<undefined> | undefined {
+	let results: Array<PromiseLike<unknown>> | undefined;
 	ctx.f |= IsUnmounted;
 	clearEventListeners(ctx);
 	const callbacks = cleanupMap.get(ctx);
@@ -2060,7 +2107,10 @@ function unmountComponent(ctx: ContextInternals): void {
 		cleanupMap.delete(ctx);
 		const value = ctx.renderer.read(getValue(ctx.ret));
 		for (const callback of callbacks) {
-			callback(value);
+			const result = callback(value);
+			if (isPromiseLike(result)) {
+				(results = results || []).push(result);
+			}
 		}
 	}
 
@@ -2078,6 +2128,10 @@ function unmountComponent(ctx: ContextInternals): void {
 				ctx.f &= ~IsExecuting;
 			}
 		}
+	}
+
+	if (results) {
+		return Promise.all(results).then(() => undefined); // void :(
 	}
 }
 
